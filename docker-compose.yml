@@ -1,0 +1,20 @@
+name: urlshort
+
+services:
+  pgsql:
+    image: postgres
+    container_name: postgres
+    environment:
+        POSTGRES_USER: dbuser
+        POSTGRES_DB: urlshort
+        POSTGRES_PASSWORD: dbpass
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis
+    container_name: redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    restart: always
+    ports:
+      - "6379:6379"
