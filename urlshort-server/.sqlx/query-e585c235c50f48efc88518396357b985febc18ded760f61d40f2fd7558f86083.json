@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO links(token, url) VALUES ($1,$2);",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e585c235c50f48efc88518396357b985febc18ded760f61d40f2fd7558f86083"
+}

@@ -42,7 +42,17 @@ fn generate_token() -> String {
     )
 }
 
-async fn health() -> impl IntoResponse {}
+async fn health() -> axum::response::Result<()> {
+    Ok(())
+}
+
+async fn live(State(state): State<Arc<AppState>>) -> axum::response::Result<()> {
+    sqlx::query(r"SELECT 1;")
+        .execute(&state.pg)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    Ok(())
+}
 
 async fn read_from_cache<T, U>(redis: &ConnectionManager, key: &T) -> Option<U>
 where
@@ -167,9 +177,11 @@ async fn main() {
 
     let db_url = env::var("DATABASE_URL").expect("The database url should be there");
     let redis_url = env::var("REDIS_URL").expect("The cache url should be there");
+    let host = env::var("LISTEN_HOST").expect("The listening host should be there");
+
     let pg = PgPoolOptions::new()
         .max_connections(50)
-        .acquire_timeout(Duration::from_secs(3))
+        .acquire_timeout(Duration::from_secs(30))
         .idle_timeout(Duration::from_secs(10))
         .connect(&db_url)
         .await
@@ -185,13 +197,25 @@ async fn main() {
 
     let api = Router::new()
         .route("/links", post(create_link))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/live", get(live));
+
+    sqlx::migrate!(r#"./migrations/"#)
+        .run(&pg)
+        .await
+        .expect("cannot run migrations");
 
     let app = Router::new()
         .route("/{id}", get(redirect_to_link))
         .nest("/api/v1/", api)
         .with_state(Arc::new(AppState { pg: pg, redis }));
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8001").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&host)
+        .await
+        .expect(&format!("Cannot bind on {host}"));
+    info!("Listening on {host}");
+
+    axum::serve(listener, app)
+        .await
+        .expect("Cannot start server");
 }

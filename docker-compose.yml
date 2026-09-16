@@ -10,6 +10,11 @@ services:
         POSTGRES_PASSWORD: dbpass
     ports:
       - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d mydb"]
+      interval: 1s
+      timeout: 10s
+      retries: 5
 
   redis:
     image: redis
@@ -18,3 +23,25 @@ services:
     restart: always
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  urlshort-server:
+    container_name: urlshort-server
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://dbuser:dbpass@pgsql/urlshort
+      REDIS_URL: redis://redis/
+      LISTEN_HOST: 0.0.0.0:80
+    ports:
+      - "80:80"
+    depends_on:
+      pgsql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
