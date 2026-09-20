@@ -18,6 +18,7 @@ use rand::seq::IndexedRandom;
 use redis::{AsyncCommands, FromRedisValue, ToSingleRedisArg, aio::ConnectionManager};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, query};
 use validator::Validate;
 
@@ -34,6 +35,7 @@ struct Assets;
 
 const TOKEN_SIZE: usize = 11;
 
+#[tracing::instrument]
 fn generate_token() -> String {
     let mut rng = rand::rng();
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890";
@@ -45,18 +47,30 @@ fn generate_token() -> String {
         })
 }
 
-async fn health() -> axum::response::Result<()> {
-    Ok(())
+#[tracing::instrument]
+async fn health() -> axum::response::Result<axum::response::Response> {
+    Ok(Json(json!({
+        "status":"healthy",
+    }))
+    .into_response())
 }
 
-async fn live(State(state): State<Arc<AppState>>) -> axum::response::Result<()> {
+#[tracing::instrument]
+async fn live(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Result<axum::response::Response> {
     sqlx::query(r"SELECT 1;")
         .execute(&state.pg)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-    Ok(())
+
+    Ok(Json(json!({
+        "status":"healthy",
+    }))
+    .into_response())
 }
 
+#[tracing::instrument]
 async fn read_from_cache<T, U>(redis: &ConnectionManager, key: &T) -> Option<U>
 where
     T: ToString + Debug,
@@ -66,15 +80,16 @@ where
     let key = key.to_string();
 
     let value = redis.get(&key).await.ok()?;
-    info!("Data read from cache {:?}=>>{:?}", key, value);
+    info!("Data read from cache {:?}=>{:?}", key, value);
 
     value
 }
 
+#[tracing::instrument]
 async fn write_to_cache<T, U>(redis: &ConnectionManager, key: T, val: U)
 where
-    T: ToSingleRedisArg + Send + Sync + Display,
-    U: ToSingleRedisArg + Send + Sync + Display,
+    T: ToSingleRedisArg + Send + Sync + Display + Debug,
+    U: ToSingleRedisArg + Send + Sync + Display + Debug,
 {
     let mut redis = redis.clone();
 
@@ -88,14 +103,14 @@ struct LinksCreateRequest {
     url: String,
 }
 
-#[derive(Template)]
+#[derive(Debug, Template)]
 #[template(path = "generated_url_part.html")]
 struct UrlPartTemplate<'a> {
     url: &'a str,
     full_url: &'a str,
 }
 
-#[derive(Template)]
+#[derive(Debug, Template)]
 #[template(path = "generated_url_error_part.html")]
 struct UrlErrorPartTemplate<'a> {
     error: &'a str,
@@ -104,10 +119,8 @@ struct UrlErrorPartTemplate<'a> {
 #[derive(Debug)]
 enum UrlShortError {
     NotFound(String),
-    Conflicted(String),
     Generic(String),
     DBError(sqlx::Error),
-    WebError(axum::Error),
 }
 
 impl Display for UrlShortError {
@@ -115,9 +128,7 @@ impl Display for UrlShortError {
         match self {
             UrlShortError::DBError(e) => write!(f, "Db Error: {e}"),
             UrlShortError::Generic(e) => write!(f, "Generic Error: {e}"),
-            UrlShortError::WebError(e) => write!(f, "Web Error: {e}"),
             UrlShortError::NotFound(e) => write!(f, "Resource not Found: {e}"),
-            UrlShortError::Conflicted(e) => write!(f, "Conflicted Resource: {e}"),
         }
     }
 }
@@ -127,19 +138,11 @@ impl std::error::Error for UrlShortError {}
 impl IntoResponse for UrlShortError {
     fn into_response(self) -> axum::response::Response {
         match self {
-            Self::Conflicted(e) => Response::builder()
-                .status(StatusCode::CONFLICT.as_u16())
-                .body(axum::body::Body::from(e))
-                .unwrap(),
             Self::NotFound(e) => Response::builder()
                 .status(StatusCode::NOT_FOUND.as_u16())
                 .body(axum::body::Body::from(e))
                 .unwrap(),
             Self::DBError(e) => Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
-                .body(axum::body::Body::from(e.to_string()))
-                .unwrap(),
-            Self::WebError(e) => Response::builder()
                 .status(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
                 .body(axum::body::Body::from(e.to_string()))
                 .unwrap(),
@@ -200,7 +203,8 @@ async fn create_link_internal(state: &Arc<AppState>, url: &str) -> Result<String
     )))
 }
 
-fn render_template(template: impl Template) -> axum::response::Html<String> {
+#[tracing::instrument]
+fn render_template(template: impl Template + Debug) -> axum::response::Html<String> {
     template
         .render()
         .unwrap_or("<Unknown Template Rendering>".into())
@@ -312,6 +316,7 @@ async fn home() -> axum::response::Result<axum::response::Html<String>> {
 }
 
 #[tokio::main]
+#[tracing::instrument]
 async fn main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt().init();

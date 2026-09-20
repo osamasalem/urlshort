@@ -21,10 +21,17 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
+
 WORKDIR /urlshort
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /urlshort/target/release/urlshort-server /urlshort/urlshort-server
 
-EXPOSE 8001
+
+EXPOSE 80
 
 CMD ["/urlshort/urlshort-server"]
