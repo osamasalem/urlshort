@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UrlShorter</title>
+    <script src="/assets/htmx.min.js"></script>
+    <script src="/assets/tailwind.3.4.17.js"></script>
+</head>
+
+<body class="min-h-screen bg-gray-100 text-green-950">
+
+    <main class="min-h-screen flex items-center justify-center px-6">
+        <div class="w-full max-w-2xl text-center">
+
+            <h1 class="text-5xl font-bold tracking-tight mb-10">
+                UrlShorter
+            </h1>
+
+            <form class="space-y-6" hx-post="/api/v1/links/generate" hx-target="#response" hx-indicator="#spinner"
+                hx-swap="innerHTML">
+                <input type="text" name="url" placeholder="Enter your text..." class="font-sans w-full rounded-lg border border-gray-300 bg-white px-5 py-4
+                           text-lg text-gray-900 shadow-sm
+                           outline-none transition
+                           focus:border-green-800 focus:ring-2 focus:ring-green-800/20">
+
+                <!-- Button -->
+                <button type="submit" class="hx-disable w-96 rounded-lg bg-green-900 px-6 py-4
+                text-lg font-semibold text-white
+                shadow-sm transition
+                hover:bg-green-800
+                focus:outline-none focus:ring-2 focus:ring-green-800 focus:ring-offset-2">
+                    <div style="display: inline;">
+                        <span>Submit</span>
+                    </div>
+
+                    <!-- Tailwind Loading Spinner: Hidden by default, shown during .htmx-request -->
+                </button>
+
+            </form>
+            <div class="mx-6 my-6" id="response">
+
+            </div>
+
+            <!-- <div class="h-8 w-8 animate-spin rounded-full border-4 border-blue-500 border-t-transparent"></div> -->
+        </div>
+    </main>
+
+</body>
+
+</html>

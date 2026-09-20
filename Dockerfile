@@ -11,6 +11,9 @@ WORKDIR /urlshort
 COPY urlshort-server/src ./src
 COPY urlshort-server/migrations ./migrations
 COPY urlshort-server/.sqlx ./.sqlx
+COPY urlshort-server/templates ./templates
+COPY urlshort-server/assets ./assets
+
 COPY urlshort-server/Cargo.toml ./
 COPY urlshort-server/Cargo.lock ./
 

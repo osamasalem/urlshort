@@ -1,45 +1,48 @@
 use std::{
     env,
     fmt::{Debug, Display},
-    str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
+use askama::Template;
 use axum::{
-    Json, Router,
+    Form, Json, Router,
     extract::{Path, Query, State},
-    http::{Response, StatusCode, Uri},
-    response::{IntoResponse, Redirect},
+    http::{Response, StatusCode},
+    response::{self, Html, IntoResponse, Redirect},
     routing::{get, post},
 };
 use log::{error, info};
 use rand::seq::IndexedRandom;
-use redis::{
-    AsyncCommands, FromRedisValue, ToSingleRedisArg,
-    aio::{ConnectionManager, MultiplexedConnection},
-};
+use redis::{AsyncCommands, FromRedisValue, ToSingleRedisArg, aio::ConnectionManager};
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, error::DatabaseError, postgres::PgPoolOptions};
-use tracing::instrument;
+use sqlx::{PgPool, postgres::PgPoolOptions, query};
 use validator::Validate;
 
 #[derive(Clone, Debug)]
 struct AppState {
+    pub_url: String,
     pg: PgPool,
     redis: ConnectionManager,
 }
 
+#[derive(Embed)]
+#[folder = "assets"]
+struct Assets;
+
+const TOKEN_SIZE: usize = 11;
+
 fn generate_token() -> String {
     let mut rng = rand::rng();
     let chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz1234567890";
-    (0..11).map(|_| chars.choose(&mut rng).unwrap()).fold(
-        String::with_capacity(11),
-        |mut acc, &i| {
+    (0..TOKEN_SIZE)
+        .map(|_| chars.choose(&mut rng).unwrap())
+        .fold(String::with_capacity(TOKEN_SIZE), |mut acc, &i| {
             acc.push(i.into());
             acc
-        },
-    )
+        })
 }
 
 async fn health() -> axum::response::Result<()> {
@@ -76,7 +79,7 @@ where
     let mut redis = redis.clone();
 
     let _ = redis.set_ex::<&T, &U, ()>(&key, &val, 10).await;
-    info!("Data written to cache {}=>>{}", key, val);
+    info!("Data written to cache {}=>{}", key, val);
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -85,75 +88,192 @@ struct LinksCreateRequest {
     url: String,
 }
 
-#[derive(Debug, Serialize)]
-struct LinksCreateResponse {
-    token: String,
+#[derive(Template)]
+#[template(path = "generated_url_part.html")]
+struct UrlPartTemplate<'a> {
+    url: &'a str,
+    full_url: &'a str,
+}
+
+#[derive(Template)]
+#[template(path = "generated_url_error_part.html")]
+struct UrlErrorPartTemplate<'a> {
+    error: &'a str,
+}
+
+#[derive(Debug)]
+enum UrlShortError {
+    NotFound(String),
+    Conflicted(String),
+    Generic(String),
+    DBError(sqlx::Error),
+    WebError(axum::Error),
+}
+
+impl Display for UrlShortError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UrlShortError::DBError(e) => write!(f, "Db Error: {e}"),
+            UrlShortError::Generic(e) => write!(f, "Generic Error: {e}"),
+            UrlShortError::WebError(e) => write!(f, "Web Error: {e}"),
+            UrlShortError::NotFound(e) => write!(f, "Resource not Found: {e}"),
+            UrlShortError::Conflicted(e) => write!(f, "Conflicted Resource: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for UrlShortError {}
+
+impl IntoResponse for UrlShortError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Conflicted(e) => Response::builder()
+                .status(StatusCode::CONFLICT.as_u16())
+                .body(axum::body::Body::from(e))
+                .unwrap(),
+            Self::NotFound(e) => Response::builder()
+                .status(StatusCode::NOT_FOUND.as_u16())
+                .body(axum::body::Body::from(e))
+                .unwrap(),
+            Self::DBError(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+                .body(axum::body::Body::from(e.to_string()))
+                .unwrap(),
+            Self::WebError(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+                .body(axum::body::Body::from(e.to_string()))
+                .unwrap(),
+            Self::Generic(e) => Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR.as_u16())
+                .body(axum::body::Body::from(e))
+                .unwrap(),
+        }
+    }
 }
 
 #[tracing::instrument]
-async fn create_link(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<LinksCreateRequest>,
-) -> axum::response::Result<Json<LinksCreateResponse>> {
-    // not found in cache..
-    match sqlx::query!(r"SELECT * FROM links WHERE url = $1;", req.url)
+async fn get_token_from_url(state: &Arc<AppState>, url: &str) -> Result<String, UrlShortError> {
+    if let Some(u) = read_from_cache(&state.redis, &url).await {
+        return Ok(u);
+    }
+
+    match sqlx::query!(r"SELECT token FROM links WHERE url = $1 LIMIT 1;", url)
         .fetch_one(&state.pg)
         .await
     {
-        Ok(_) => {
-            info!("Record already exist.. exit");
-            return Err((StatusCode::CONFLICT, "Already Exist").into());
+        Ok(row) => {
+            info!("Record found.. ");
+            write_to_cache(&state.redis, url, &row.token).await;
+            Ok(row.token)
         }
-        Err(sqlx::Error::RowNotFound) => {}
+        Err(sqlx::Error::RowNotFound) => Err(UrlShortError::NotFound("token not found".into())),
         Err(e) => {
             error!("Internal error [{e}]");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into());
+            return Err(UrlShortError::DBError(e));
+        }
+    }
+}
+
+#[tracing::instrument]
+async fn create_link_internal(state: &Arc<AppState>, url: &str) -> Result<String, UrlShortError> {
+    for _ in 0..=10 {
+        let token = generate_token();
+        info!("Inserting token.. [{token}]");
+        match sqlx::query!(r"INSERT INTO links(token, url) VALUES ($1,$2);", token, url)
+            .execute(&state.pg)
+            .await
+        {
+            Ok(_) => {
+                let _ = write_to_cache(&state.redis, &token, url).await;
+                return Ok(token);
+            }
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {}
+            Err(e) => {
+                return Err(UrlShortError::DBError(e));
+            }
         }
     }
 
-    for i in 0..=10 {
-        let token = generate_token();
-        info!("Inserting token.. [{token}]");
-        match sqlx::query!(
-            r"INSERT INTO links(token, url) VALUES ($1,$2);",
-            token,
-            req.url
-        )
-        .execute(&state.pg)
-        .await
-        {
-            Ok(_) => {
-                let _ = write_to_cache(&state.redis, &token, req.url).await;
-                return Ok(LinksCreateResponse { token }.into());
+    Err(UrlShortError::Generic(format!(
+        "Unexpected error at {}",
+        line!()
+    )))
+}
+
+fn render_template(template: impl Template) -> axum::response::Html<String> {
+    template
+        .render()
+        .unwrap_or("<Unknown Template Rendering>".into())
+        .into()
+}
+
+#[tracing::instrument]
+async fn generate(
+    State(state): State<Arc<AppState>>,
+    Form(req): Form<LinksCreateRequest>,
+) -> axum::response::Html<String> {
+    if req.validate().is_err() {
+        return render_template(UrlErrorPartTemplate {
+            error: "You entered invalid URL",
+        });
+    };
+
+    let token = match get_token_from_url(&state, &req.url).await {
+        Ok(value) => value,
+        _ => match create_link_internal(&state, &req.url).await {
+            Ok(value) => value,
+            Err(_) => {
+                return render_template(UrlErrorPartTemplate {
+                    error: "Server side problem, Please contact support or try again.",
+                });
             }
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {}
-            Err(e) if i == 10 => {
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into());
+        },
+    };
+
+    let full_url = format!("{}/{}", state.pub_url, token);
+
+    render_template(UrlPartTemplate {
+        url: &token,
+        full_url: &full_url,
+    })
+}
+
+#[tracing::instrument]
+async fn assets(Path(path): Path<String>) -> axum::response::Result<axum::response::Response> {
+    let asset = match Assets::get(&path) {
+        Some(asset) => asset,
+        None => match Assets::get("404.html") {
+            Some(asset) => asset,
+            None => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, "Asset resolution failed").into());
             }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    Err((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Unexpected error at {}", line!()),
-    )
-        .into())
+        },
+    };
+
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+
+    let resp = axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+        .header(axum::http::header::CACHE_CONTROL, "public, max-age=300")
+        .body(axum::body::Body::from(asset.data))
+        .unwrap_or((StatusCode::INTERNAL_SERVER_ERROR, "Error rendering asset").into_response());
+
+    Ok(resp)
 }
 
 #[tracing::instrument]
 async fn redirect_to_link(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
-) -> axum::response::Result<Redirect> {
-    if token.len() != 11 {
+) -> axum::response::Result<response::Response> {
+    if token.len() != TOKEN_SIZE {
         error!("Bad request");
-        return Err((StatusCode::BAD_REQUEST, "Bad token").into());
+        return assets(Path("404.html".into())).await;
     }
 
     if let Some(url) = read_from_cache::<_, String>(&state.redis, &token).await {
         info!("Redirecting to [{url}]");
-        return Ok(Redirect::permanent(&url));
+        return Ok(Redirect::permanent(&url).into_response());
     }
 
     // not found in cache..
@@ -163,11 +283,32 @@ async fn redirect_to_link(
     {
         Ok(row) => {
             let _ = write_to_cache(&state.redis, &token, &row.url).await;
-            Ok(Redirect::permanent(&token))
+            Ok(Redirect::permanent(&row.url).into_response())
         }
-        Err(sqlx::Error::RowNotFound) => Err((StatusCode::NOT_FOUND, "Record not found!!").into()),
+        Err(sqlx::Error::RowNotFound) => return assets(Path("404.html".into())).await,
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into()),
     }
+}
+
+#[tracing::instrument]
+async fn home() -> axum::response::Result<axum::response::Html<String>> {
+    let Some(data) = Assets::get("home.html") else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot get home page data",
+        )
+            .into());
+    };
+
+    let Ok(text) = str::from_utf8(&data.data) else {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cannot get encode home page",
+        )
+            .into());
+    };
+
+    Ok(Html(text.to_string()))
 }
 
 #[tokio::main]
@@ -178,6 +319,7 @@ async fn main() {
     let db_url = env::var("DATABASE_URL").expect("The database url should be there");
     let redis_url = env::var("REDIS_URL").expect("The cache url should be there");
     let host = env::var("LISTEN_HOST").expect("The listening host should be there");
+    let pub_url = env::var("PUBLIC_URL").unwrap_or("http://example.com".into());
 
     let pg = PgPoolOptions::new()
         .max_connections(50)
@@ -196,9 +338,10 @@ async fn main() {
     info!("{}", db_url);
 
     let api = Router::new()
-        .route("/links", post(create_link))
         .route("/health", get(health))
-        .route("/live", get(live));
+        .route("/links/generate", post(generate))
+        .route("/live", get(live))
+        .fallback(async || (StatusCode::NOT_FOUND, "Not Found"));
 
     sqlx::migrate!(r#"./migrations/"#)
         .run(&pg)
@@ -206,9 +349,12 @@ async fn main() {
         .expect("cannot run migrations");
 
     let app = Router::new()
+        .route("/", get(home))
         .route("/{id}", get(redirect_to_link))
+        .route("/assets/{*path}", get(assets))
         .nest("/api/v1/", api)
-        .with_state(Arc::new(AppState { pg: pg, redis }));
+        .with_state(Arc::new(AppState { pg, redis, pub_url }))
+        .fallback(async || assets(Path("404.html".into())).await);
 
     let listener = tokio::net::TcpListener::bind(&host)
         .await
