@@ -1,6 +1,9 @@
+// cSpell:disable
 use std::{
+    collections::HashMap,
     env,
     fmt::{Debug, Display},
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
@@ -17,15 +20,20 @@ use log::{error, info};
 use rand::seq::IndexedRandom;
 use redis::{AsyncCommands, FromRedisValue, ToSingleRedisArg, aio::ConnectionManager};
 use rust_embed::Embed;
+use scylla::{
+    client::{session::Session, session_builder::SessionBuilder},
+    errors::ExecutionError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlx::{PgPool, postgres::PgPoolOptions, query};
 use validator::Validate;
 
-#[derive(Clone, Debug)]
+use futures::{FutureExt, future::BoxFuture, stream::StreamExt};
+
+#[derive(Debug)]
 struct AppState {
     pub_url: String,
-    pg: PgPool,
+    db: Session,
     redis: ConnectionManager,
 }
 
@@ -59,10 +67,10 @@ async fn health() -> axum::response::Result<axum::response::Response> {
 async fn live(
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Result<axum::response::Response> {
-    sqlx::query(r"SELECT 1;")
-        .execute(&state.pg)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
+    // sqlx::query(r"SELECT 1;")
+    //     .execute(&state.pg)
+    //     .await
+    //     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
 
     Ok(Json(json!({
         "status":"healthy",
@@ -120,7 +128,7 @@ struct UrlErrorPartTemplate<'a> {
 enum UrlShortError {
     NotFound(String),
     Generic(String),
-    DBError(sqlx::Error),
+    DBError(String),
 }
 
 impl Display for UrlShortError {
@@ -160,21 +168,28 @@ async fn get_token_from_url(state: &Arc<AppState>, url: &str) -> Result<String, 
         return Ok(u);
     }
 
-    match sqlx::query!(r"SELECT token FROM links WHERE url = $1 LIMIT 1;", url)
-        .fetch_one(&state.pg)
+    let res = state
+        .db
+        .query_iter(
+            r#"SELECT tokenid FROM urlshort.links WHERE url = ? LIMIT 1;"#,
+            (&url,),
+        )
         .await
-    {
-        Ok(row) => {
-            info!("Record found.. ");
-            write_to_cache(&state.redis, url, &row.token).await;
-            Ok(row.token)
-        }
-        Err(sqlx::Error::RowNotFound) => Err(UrlShortError::NotFound("token not found".into())),
-        Err(e) => {
-            error!("Internal error [{e}]");
-            return Err(UrlShortError::DBError(e));
-        }
-    }
+        .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+    let mut tystream = res
+        .rows_stream::<(String,)>()
+        .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+    let (token,) = tystream
+        .next()
+        .await
+        .ok_or_else(|| UrlShortError::Generic("No record found".to_string()))?
+        .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+    info!("Record found.. ");
+    write_to_cache(&state.redis, url, &token).await;
+    Ok(token)
 }
 
 #[tracing::instrument]
@@ -182,21 +197,31 @@ async fn create_link_internal(state: &Arc<AppState>, url: &str) -> Result<String
     for _ in 0..=10 {
         let token = generate_token();
         info!("Inserting token.. [{token}]");
-        match sqlx::query!(r"INSERT INTO links(token, url) VALUES ($1,$2);", token, url)
-            .execute(&state.pg)
+
+        let res = state
+            .db
+            .query_iter(
+                r#"INSERT INTO urlshort.links (tokenid, url) VALUES(?, ?) IF NOT EXISTS;"#,
+                (&token, &url),
+            )
             .await
-        {
-            Ok(_) => {
-                let _ = write_to_cache(&state.redis, &token, url).await;
-                return Ok(token);
-            }
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {}
-            Err(e) => {
-                return Err(UrlShortError::DBError(e));
-            }
+            .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+        let mut tystream = res
+            .rows_stream::<(bool, Option<String>, Option<String>)>()
+            .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+        let (applied, ..) = tystream
+            .next()
+            .await
+            .ok_or_else(|| UrlShortError::Generic("No record found".to_string()))?
+            .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+        if applied {
+            let _ = write_to_cache(&state.redis, &token, url).await;
+            return Ok(token);
         }
     }
-
     Err(UrlShortError::Generic(format!(
         "Unexpected error at {}",
         line!()
@@ -226,9 +251,11 @@ async fn generate(
         Ok(value) => value,
         _ => match create_link_internal(&state, &req.url).await {
             Ok(value) => value,
-            Err(_) => {
+            Err(e) => {
                 return render_template(UrlErrorPartTemplate {
-                    error: "Server side problem, Please contact support or try again.",
+                    error: &format!(
+                        "Server side problem, Please contact support or try again. {e}"
+                    ),
                 });
             }
         },
@@ -281,17 +308,41 @@ async fn redirect_to_link(
     }
 
     // not found in cache..
-    match sqlx::query!(r"SELECT url FROM links WHERE token = $1;", token)
-        .fetch_one(&state.pg)
+    let query_pager = state
+        .db
+        .query_iter(
+            r"SELECT url FROM urlshort.links WHERE tokenid = ? LIMIT 1;",
+            (&token,),
+        )
         .await
-    {
-        Ok(row) => {
-            let _ = write_to_cache(&state.redis, &token, &row.url).await;
-            Ok(Redirect::permanent(&row.url).into_response())
-        }
-        Err(sqlx::Error::RowNotFound) => return assets(Path("404.html".into())).await,
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into()),
-    }
+        .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+    let mut type_rows = query_pager
+        .rows_stream::<(String,)>()
+        .map_err(|e| UrlShortError::Generic(e.to_string()))?;
+
+    let Some(Ok(row)) = type_rows.next().await else {
+        return assets(Path("404.html".into())).await;
+    };
+
+    let _ = write_to_cache(&state.redis, &token, &row.0).await;
+    Ok(Redirect::permanent(&row.0).into_response())
+    // {
+    //     Ok(row) => {
+    //         let r = row
+    //             .rows_stream::<(String,)>()
+    //             .unwrap()
+    //             .next()
+    //             .await
+    //             .unwrap()
+    //             .unwrap();
+
+    //         let _ = write_to_cache(&state.redis, &token, &r.0).await;
+    //         Ok(Redirect::permanent(&r.0).into_response())
+    //     }
+    //     Err(sqlx::Error::RowNotFound) => return assets(Path("404.html".into())).await,
+    //     Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into()),
+    // }
 }
 
 #[tracing::instrument]
@@ -315,24 +366,43 @@ async fn home() -> axum::response::Result<axum::response::Html<String>> {
     Ok(Html(text.to_string()))
 }
 
+async fn migrate(session: &Session) -> Result<(), ExecutionError> {
+    session
+        .query_unpaged(
+            "CREATE KEYSPACE IF NOT EXISTS urlshort WITH REPLICATION = \
+            {'class' : 'NetworkTopologyStrategy', 'datacenter1' : 2 }",
+            &[],
+        )
+        .await?;
+
+    session
+        .query_unpaged(
+            r#"CREATE TABLE IF NOT EXISTS urlshort.links (tokenid TEXT PRIMARY KEY, url TEXT)"#,
+            &[],
+        )
+        .await?;
+    Ok(())
+}
+
 #[tokio::main]
 #[tracing::instrument]
 async fn main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt().init();
 
-    let db_url = env::var("DATABASE_URL").expect("The database url should be there");
+    let known_nodes = env::var("SCYLLADB_KNOWN_NODES").expect("The db nodes should be there");
     let redis_url = env::var("REDIS_URL").expect("The cache url should be there");
     let host = env::var("LISTEN_HOST").expect("The listening host should be there");
     let pub_url = env::var("PUBLIC_URL").unwrap_or("http://example.com".into());
 
-    let pg = PgPoolOptions::new()
-        .max_connections(50)
-        .acquire_timeout(Duration::from_secs(30))
-        .idle_timeout(Duration::from_secs(10))
-        .connect(&db_url)
+    let known_nodes: Vec<_> = known_nodes.split(',').collect();
+    let db: Session = SessionBuilder::new()
+        .known_nodes(known_nodes)
+        .connection_timeout(Duration::from_secs(30))
+        .cluster_metadata_refresh_interval(Duration::from_secs(30))
+        .build()
         .await
-        .expect("Cannot connect to database");
+        .expect("Cannot connect to DB");
 
     let redis = redis::Client::open(redis_url)
         .expect("Cannot connect to cache")
@@ -340,25 +410,20 @@ async fn main() {
         .await
         .expect("Cannot get cache connection");
 
-    info!("{}", db_url);
-
     let api = Router::new()
         .route("/health", get(health))
         .route("/links/generate", post(generate))
         .route("/live", get(live))
         .fallback(async || (StatusCode::NOT_FOUND, "Not Found"));
 
-    sqlx::migrate!(r#"./migrations/"#)
-        .run(&pg)
-        .await
-        .expect("cannot run migrations");
+    migrate(&db).await.expect("Migration should work");
 
     let app = Router::new()
         .route("/", get(home))
         .route("/{id}", get(redirect_to_link))
         .route("/assets/{*path}", get(assets))
         .nest("/api/v1/", api)
-        .with_state(Arc::new(AppState { pg, redis, pub_url }))
+        .with_state(Arc::new(AppState { db, redis, pub_url }))
         .fallback(async || assets(Path("404.html".into())).await);
 
     let listener = tokio::net::TcpListener::bind(&host)
