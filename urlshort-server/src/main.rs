@@ -160,10 +160,12 @@ impl IntoResponse for UrlShortError {
 
 #[tracing::instrument]
 async fn get_token_from_url(state: &Arc<AppState>, url: &str) -> Result<String, UrlShortError> {
-    if let Some(u) = read_from_cache(&state.redis, &url).await {
-        return Ok(u);
+    if let Some(token) = read_from_cache(&state.redis, &url).await {
+        info!("Found the token [{token}] in cahce from [{url}]");
+        return Ok(token);
     }
 
+    info!("Not Found in cache for [{url}].. searching db");
     let res = state
         .db
         .query_iter(
@@ -183,7 +185,7 @@ async fn get_token_from_url(state: &Arc<AppState>, url: &str) -> Result<String, 
         .ok_or_else(|| UrlShortError::Generic("No record found".to_string()))?
         .map_err(|e| UrlShortError::Generic(e.to_string()))?;
 
-    info!("Record found.. ");
+    info!("Found the token [{token}] in DB from [{url}]");
     write_to_cache(&state.redis, url, &token).await;
     Ok(token)
 }
@@ -214,6 +216,7 @@ async fn create_link_internal(state: &Arc<AppState>, url: &str) -> Result<String
             .map_err(|e| UrlShortError::Generic(e.to_string()))?;
 
         if applied {
+            info!("Record added to DB [{token} => {url}");
             let _ = write_to_cache(&state.redis, &token, url).await;
             return Ok(token);
         }
@@ -245,20 +248,25 @@ async fn generate(
 
     let token = match get_token_from_url(&state, &req.url).await {
         Ok(value) => value,
-        _ => match create_link_internal(&state, &req.url).await {
-            Ok(value) => value,
-            Err(e) => {
-                return render_template(UrlErrorPartTemplate {
-                    error: &format!(
-                        "Server side problem, Please contact support or try again. {e}"
-                    ),
-                });
+        Err(e) => {
+            error!("Error getting token from url [{e}]");
+            match create_link_internal(&state, &req.url).await {
+                Ok(value) => value,
+                Err(e) => {
+                    error!("Error creating link [{e}]");
+                    return render_template(UrlErrorPartTemplate {
+                        error: &format!(
+                            "Server side problem, Please contact support or try again. {e}"
+                        ),
+                    });
+                }
             }
-        },
+        }
     };
 
     let full_url = format!("{}/{}", state.pub_url, token);
 
+    info!("FullUrl [{full_url}]");
     counter!("urlshort_generate_count").increment(1);
     render_template(UrlPartTemplate {
         url: &token,

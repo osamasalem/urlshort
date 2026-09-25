@@ -1,16 +1,13 @@
 FROM rust:1.98.1-bookworm AS builder
 
-ARG DATABASE_URL
+ARG SCYLLADB_KNOWN_NODES
 ARG REDIS_URL
 ARG LISTEN_HOST
-
-ENV SQLX_OFFLINE=true
+ARG PUBLIC_URL
 
 WORKDIR /urlshort
 
 COPY urlshort-server/src ./src
-COPY urlshort-server/migrations ./migrations
-COPY urlshort-server/.sqlx ./.sqlx
 COPY urlshort-server/templates ./templates
 COPY urlshort-server/assets ./assets
 
