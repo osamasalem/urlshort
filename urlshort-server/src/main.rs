@@ -16,6 +16,7 @@ use axum::{
     response::{self, Html, IntoResponse, Redirect},
     routing::{get, post},
 };
+use axum_prometheus::{PrometheusMetricLayer, metrics::counter};
 use log::{error, info};
 use rand::seq::IndexedRandom;
 use redis::{AsyncCommands, FromRedisValue, ToSingleRedisArg, aio::ConnectionManager};
@@ -67,11 +68,6 @@ async fn health() -> axum::response::Result<axum::response::Response> {
 async fn live(
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Result<axum::response::Response> {
-    // sqlx::query(r"SELECT 1;")
-    //     .execute(&state.pg)
-    //     .await
-    //     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-
     Ok(Json(json!({
         "status":"healthy",
     }))
@@ -263,6 +259,7 @@ async fn generate(
 
     let full_url = format!("{}/{}", state.pub_url, token);
 
+    counter!("urlshort_generate_count").increment(1);
     render_template(UrlPartTemplate {
         url: &token,
         full_url: &full_url,
@@ -326,23 +323,9 @@ async fn redirect_to_link(
     };
 
     let _ = write_to_cache(&state.redis, &token, &row.0).await;
-    Ok(Redirect::permanent(&row.0).into_response())
-    // {
-    //     Ok(row) => {
-    //         let r = row
-    //             .rows_stream::<(String,)>()
-    //             .unwrap()
-    //             .next()
-    //             .await
-    //             .unwrap()
-    //             .unwrap();
+    counter!("urlshort_redirect_count").increment(1);
 
-    //         let _ = write_to_cache(&state.redis, &token, &r.0).await;
-    //         Ok(Redirect::permanent(&r.0).into_response())
-    //     }
-    //     Err(sqlx::Error::RowNotFound) => return assets(Path("404.html".into())).await,
-    //     Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into()),
-    // }
+    Ok(Redirect::permanent(&row.0).into_response())
 }
 
 #[tracing::instrument]
@@ -390,6 +373,8 @@ async fn main() {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt().init();
 
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
+
     let known_nodes = env::var("SCYLLADB_KNOWN_NODES").expect("The db nodes should be there");
     let redis_url = env::var("REDIS_URL").expect("The cache url should be there");
     let host = env::var("LISTEN_HOST").expect("The listening host should be there");
@@ -411,10 +396,12 @@ async fn main() {
         .expect("Cannot get cache connection");
 
     let api = Router::new()
+        .route("/metrics", get(|| async move { metric_handle.render() }))
         .route("/health", get(health))
         .route("/links/generate", post(generate))
         .route("/live", get(live))
-        .fallback(async || (StatusCode::NOT_FOUND, "Not Found"));
+        .fallback(async || (StatusCode::NOT_FOUND, "Not Found"))
+        .layer(prometheus_layer);
 
     migrate(&db).await.expect("Migration should work");
 
