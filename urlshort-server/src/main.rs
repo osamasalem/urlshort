@@ -68,6 +68,12 @@ async fn health() -> axum::response::Result<axum::response::Response> {
 async fn live(
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Result<axum::response::Response> {
+    state
+        .db
+        .query_iter(r#"SELECT now() FROM system.local"#, ())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     Ok(Json(json!({
         "status":"healthy",
     }))
@@ -124,7 +130,7 @@ struct UrlErrorPartTemplate<'a> {
 enum UrlShortError {
     NotFound(String),
     Generic(String),
-    DBError(String),
+    DBError(scylla::errors::DbError),
 }
 
 impl Display for UrlShortError {
@@ -235,11 +241,12 @@ fn render_template(template: impl Template + Debug) -> axum::response::Html<Stri
         .into()
 }
 
+#[axum_macros::debug_handler]
 #[tracing::instrument]
 async fn generate(
     State(state): State<Arc<AppState>>,
     Form(req): Form<LinksCreateRequest>,
-) -> axum::response::Html<String> {
+) -> impl IntoResponse {
     if req.validate().is_err() {
         return render_template(UrlErrorPartTemplate {
             error: "You entered invalid URL",

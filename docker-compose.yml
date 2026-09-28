@@ -20,8 +20,6 @@ services:
         condition: service_healthy
       urlshort-server-2:
         condition: service_healthy
-      # urlshort-server-3:
-      #   condition: service_healthy
 
   nginx-2:
     image: nginx
@@ -39,8 +37,6 @@ services:
         condition: service_healthy
       urlshort-server-2:
         condition: service_healthy
-      # urlshort-server-3:
-      #   condition: service_healthy
 
   # DBs
   scylla-1:
@@ -52,16 +48,10 @@ services:
       --memory 750M
       --overprovisioned 1
       --api-address 0.0.0.0
-#      --listen_address 0.0.0.0
-    # ports:
-    #   - "9042:9042"
-    #   - "10000:10000"
     volumes:
       - scylla1_data:/var/lib/scylla
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:10000/system/uptime_ms"]
-      #test: ["CMD-SHELL","cqlsh localhost 9042 -e 'SELECT now() FROM system.local;'"]
-
       interval: 10s
       timeout: 5s
       retries: 10
@@ -78,14 +68,10 @@ services:
       --memory 750M
       --overprovisioned 1
       --api-address 0.0.0.0
-    # ports:
-    #   - "9042:9042"
-    #   - "10000:10000"
     volumes:
       - scylla2_data:/var/lib/scylla
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:10000/system/uptime_ms"]
-      #test: ["CMD-SHELL","cqlsh localhost 9042 -e 'SELECT now() FROM system.local;'"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -96,32 +82,6 @@ services:
       scylla-1:
         condition: service_healthy
 
-
-  # scylla-3:
-  #   image: scylladb/scylla:latest
-  #   container_name: scylla-3
-  #   command: >
-  #     --seeds=scylla-1
-  #     --smp 1
-  #     --memory 750M
-  #     --overprovisioned 1
-  #     --api-address 0.0.0.0
-  #   # ports:
-  #   #   - "9042:9042"
-  #   #   - "10000:10000"
-  #   volumes:
-  #     - scylla3_data:/var/lib/scylla
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:10000/"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 10
-  #     start_period: 30s
-  #   networks:
-  #     - scylla
-    # depends_on:
-    #   - scylla-1
-#        condition: service_healthy
 
   # CACHING
   redis:
@@ -156,12 +116,8 @@ services:
     ports:
       - "8081:80"
     depends_on:
-      #scylla-1:
-      #  condition: service_healthy
       scylla-2:
         condition: service_healthy
-      # scylla-3:
-      #   condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -188,8 +144,6 @@ services:
         condition: service_healthy
       scylla-2:
         condition: service_healthy
-      # scylla-3:
-      #   condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
@@ -198,36 +152,6 @@ services:
       timeout: 30s
       retries: 5
       start_period: 30s
-
-
-  # urlshort-server-3:
-  #   container_name: urlshort-server-3
-  #   image: urlshort-server
-  #   environment:
-  #     SCYLLADB_KNOWN_NODES: scylla-1,scylla-2,scylla-3
-  #     REDIS_URL: redis://redis/
-  #     LISTEN_HOST: 0.0.0.0:80
-  #     PUBLIC_URL: http://localhost/
-  #   networks:
-  #     - scylla
-  #   ports:
-  #     - "8083:80"
-  #   depends_on:
-  #     scylla-1:
-  #       condition: service_healthy
-  #     scylla-2:
-  #       condition: service_healthy
-  #     scylla-3:
-  #       condition: service_healthy
-  #     redis:
-  #       condition: service_healthy
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost/api/v1/health"]
-  #     interval: 30s
-  #     timeout: 30s
-  #     retries: 5
-  #     start_period: 30s
-
 
   nginx-exporter:
     image: nginx/nginx-prometheus-exporter:1.5.1
@@ -271,4 +195,3 @@ volumes:
   scylla2_data:
   prometheus_data:
   grafana_data:
-#  scylla3_data:
