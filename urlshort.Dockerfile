@@ -1,16 +1,13 @@
 FROM rust:1.98.1-bookworm AS builder
 
-ARG DATABASE_URL
+ARG SCYLLADB_KNOWN_NODES
 ARG REDIS_URL
 ARG LISTEN_HOST
-
-ENV SQLX_OFFLINE=true
+ARG PUBLIC_URL
 
 WORKDIR /urlshort
 
 COPY urlshort-server/src ./src
-COPY urlshort-server/migrations ./migrations
-COPY urlshort-server/.sqlx ./.sqlx
 COPY urlshort-server/templates ./templates
 COPY urlshort-server/assets ./assets
 
@@ -21,16 +18,9 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
-
 WORKDIR /urlshort
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY --from=builder /urlshort/target/release/urlshort-server /urlshort/urlshort-server
-
 
 EXPOSE 80
 
